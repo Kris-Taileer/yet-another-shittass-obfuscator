@@ -10,7 +10,6 @@ static inline uint64_t scramble(uint64_t x) {
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
-
 }
 
 static inline uint8_t keystream_byte (uint64_t key, uint64_t i) {
