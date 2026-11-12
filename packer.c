@@ -40,6 +40,40 @@ static void ensure_supported_elf(const Elf64_Ehdr *header) {
     }
 }
 
+static uint64_t random_build_key(void) {
+    uint64_t key = 0;
+    FILE *rng = fopen("/dev/urandom", "rb");
+    if (rng == NULL || fread(&key, sizeof(key), 1, rng) != 1) {
+        perror("oshibochka. couldn't read /dev/urandom");
+        exit(1);
+    }
+    fclose(rng);
+    return key == 0 ? 1 : key;
+}
+
+/* Finds the CLEAN_KEY sentinel g_build_key was compiled with inside the
+ * stub image and overwrites it with this build's random key, so every
+ * packed binary ships with its own key instead of the shared compile-time
+ * constant. */
+static void patch_build_key(unsigned char *stub, size_t stub_size, uint64_t key) {
+    unsigned char pattern[8];
+    for (int i = 0; i < 8; i++) pattern[i] = (unsigned char)(CLEAN_KEY >> (8 * i));
+
+    size_t match_at = 0;
+    size_t matches = 0;
+    for (size_t i = 0; i + 8 <= stub_size; i++) {
+        if (memcmp(stub + i, pattern, 8) == 0) {
+            matches++;
+            match_at = i;
+        }
+    }
+    if (matches != 1) {
+        fprintf(stderr, "oshibochka. expected exactly one build-key sentinel in stub, found %zu\n", matches);
+        exit(1);
+    }
+    for (int i = 0; i < 8; i++) stub[match_at + i] = (unsigned char)(key >> (8 * i));
+}
+
 static size_t lzss_compress(const unsigned char *input, size_t input_size, unsigned char *output) {
     size_t read_pos = 0;
     size_t write_pos = 0;
@@ -98,6 +132,8 @@ int main(int argc, char **argv) {
     ensure_supported_elf(target_header);
 
     uint64_t stub_entry_address = ((Elf64_Ehdr *)stub_elf)->e_entry;
+    uint64_t build_key = random_build_key();
+    patch_build_key(stub_code, stub_size, build_key);
     Container container;
     memset(&container, 0, sizeof(container));
     container.magic= CONTAINER_MAGIC;
@@ -131,7 +167,7 @@ int main(int argc, char **argv) {
     }
 
     for (size_t i = 0; i < blob_size; i++) {
-        blob[i] ^= keystream_byte(CLEAN_KEY, i);
+        blob[i] ^= keystream_byte(build_key, i);
     }
     const uint64_t BASE = 0x200000;
     const size_t   STUB_OFFSET = 0x100;
@@ -174,8 +210,14 @@ int main(int argc, char **argv) {
     out_ph.p_align = 0x1000;
     memcpy(output + sizeof(Elf64_Ehdr), &out_ph, sizeof(out_ph));
 
+    Container encrypted_container = container;
+    unsigned char *container_bytes = (unsigned char *)&encrypted_container;
+    for (size_t i = 0; i < sizeof(Container); i++) {
+        container_bytes[i] ^= keystream_byte(build_key, CONTAINER_KEYSTREAM_BASE + i);
+    }
+
     memcpy(output + STUB_OFFSET, stub_code,stub_size);
-    memcpy(output + CONTAINER_OFF, &container, sizeof(Container));
+    memcpy(output + CONTAINER_OFF, &encrypted_container, sizeof(Container));
     memcpy(output + blob_offset, blob,blob_size);
 
     FILE *out_file = fopen(argv[2], "wb");

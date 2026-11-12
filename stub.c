@@ -35,6 +35,17 @@ static long  sys_ptrace_traceme(void) { return syscall3(101, 0, 0, 0); }
 static long  sys_install_segv_handler(void *action) {
     return syscall6(13, 11, (long)action, 0, 8, 0, 0);
 }
+static long  sys_install_alarm_handler(void *action) {
+    return syscall6(13, 14, (long)action, 0, 8, 0, 0);
+}
+static long  sys_fork(void) { return syscall3(57, 0, 0, 0); }
+static long  sys_wait4(long pid, int *status) { return syscall6(61, pid, (long)status, 0, 0, 0, 0); }
+
+struct timeval_raw { long tv_sec; long tv_usec; };
+struct itimerval_raw { struct timeval_raw it_interval; struct timeval_raw it_value; };
+static long  sys_setitimer(struct itimerval_raw *new_value) {
+    return syscall3(38, 0, (long)new_value, 0);
+}
 
 #define PAGE_NONE 0
 #define PAGE_READ 1
@@ -81,8 +92,24 @@ static void decompress_segment(const uint8_t *input, size_t input_size, uint8_t 
     }
 }
 
+/* A successful PTRACE_TRACEME makes *this* process a tracee of its real
+ * parent for the rest of its life -- every later self-raised SIGSEGV (our
+ * lazy-unpack mechanism) would then stop waiting for a tracer that will
+ * never PTRACE_CONT it, deadlocking forever. So the probe runs in a
+ * throwaway child that does nothing but attempt it and report the
+ * verdict via its exit code; the real process never becomes a tracee. */
 static int debugger_present_ptrace(void) {
-    return sys_ptrace_traceme() < 0 ? 1 : 0;
+    long pid = sys_fork();
+    if (pid == 0) {
+        sys_exit(sys_ptrace_traceme() < 0 ? 1 : 0);
+    }
+    if (pid < 0) return 0;
+
+    int status = 0;
+    sys_wait4(pid, &status);
+    int exited_normally = (status & 0x7f) == 0;
+    int exit_code = (status >> 8) & 0xff;
+    return (exited_normally && exit_code == 1) ? 1 : 0;
 }
 
 static int debugger_present_status(void) {
@@ -119,8 +146,14 @@ static int debugger_present_timing(void) {
     return elapsed > 5000000ULL ? 1 : 0;
 }
 
+/* packer overwrites these 8 bytes in stub.bin with a fresh random key per
+ * build; must stay byte-identical to CLEAN_KEY so the patcher's pattern
+ * search finds exactly one match. volatile so the load can't be folded
+ * into the CLEAN_KEY immediate at compile time. */
+static volatile uint64_t g_build_key = CLEAN_KEY;
+
 static uint64_t compute_key(void) {
-    uint64_t key = CLEAN_KEY;
+    uint64_t key = g_build_key;
     key ^= (uint64_t)debugger_present_ptrace() * 0xD1B54A32D192ED03ULL;
     key ^= (uint64_t)debugger_present_status() * 0xCA5A826395121157ULL;
     key ^= (uint64_t)debugger_present_timing() * 0x2545F4914F6CDD1DULL;
@@ -128,8 +161,18 @@ static uint64_t compute_key(void) {
 }
 
 static uint64_t g_key;
+static Container g_container_storage;
 static const Container *g_container;
+static const uint8_t *g_blob;
 static uint8_t g_segment_ready[MAX_SEGS];
+
+static void decrypt_container(Container *out, const Container *in, uint64_t key) {
+    const uint8_t *src = (const uint8_t *)in;
+    uint8_t *dst = (uint8_t *)out;
+    for (size_t i = 0; i < sizeof(Container); i++) {
+        dst[i] = src[i] ^ keystream_byte(key, CONTAINER_KEYSTREAM_BASE + i);
+    }
+}
 
 extern void return_from_signal(void);
 __asm__(
@@ -152,10 +195,8 @@ static void on_page_fault(int signal_number, void *signal_info, void *context) {
 
         if (fault_address >= start && fault_address < end) {
             if (!g_segment_ready[i]) {
-                const uint8_t *blob = (const uint8_t *)g_container + sizeof(Container);
-
                 sys_mprotect((void *)start, end - start, PAGE_READ | PAGE_WRITE);
-                decompress_segment(blob + segment->blob_off, segment->blob_len,(uint8_t *)segment->vaddr, g_key, segment->blob_off);
+                decompress_segment(g_blob + segment->blob_off, segment->blob_len,(uint8_t *)segment->vaddr, g_key, segment->blob_off);
 
                 long permissions = 0;
                 if (segment->flags & 4) permissions |= PAGE_READ;
@@ -170,6 +211,34 @@ static void on_page_fault(int signal_number, void *signal_info, void *context) {
     sys_exit(139);
 }
 
+/* Reading a process's memory through /proc/pid/mem or a core dump bypasses
+ * page-protection flags entirely -- it walks physical pages directly, so
+ * merely mprotect'ing a decrypted segment back to PROT_NONE leaves the
+ * plaintext sitting there for any such tool to read. This handler
+ * physically wipes segments that were decrypted but are not the one
+ * currently faulting, so a snapshot taken between ticks only ever catches
+ * a few live segments in the clear, never the whole unpacked image at
+ * once. The wiped segment is simply lazily re-decrypted on next touch via
+ * the normal on_page_fault path. */
+static void on_decay_tick(int signal_number, void *signal_info, void *context) {
+    (void)signal_number;
+    (void)signal_info;
+    (void)context;
+
+    for (uint32_t i = 0; i < g_container->nsegs; i++) {
+        if (!g_segment_ready[i]) continue;
+
+        const SegDesc *segment = &g_container->segs[i];
+        uint64_t start = page_start(segment->vaddr);
+        uint64_t end   = page_end(segment->vaddr + segment->memsz);
+
+        sys_mprotect((void *)start, end - start, PAGE_READ | PAGE_WRITE);
+        for (uint8_t *p = (uint8_t *)start; p < (uint8_t *)end; p++) *p = 0;
+        sys_mprotect((void *)start, end - start, PAGE_NONE);
+        g_segment_ready[i] = 0;
+    }
+}
+
 struct signal_action {
     void *handler;
     unsigned long flags;
@@ -178,14 +247,20 @@ struct signal_action {
 };
 #define FLAG_SIGINFO 4
 #define FLAG_RESTORER 0x04000000
+#define FLAG_RESTART 0x10000000
 
 
 void stub_main(void) {
-    g_container = (const Container *)CONTAINER_ADDR;
+    const Container *raw_container = (const Container *)CONTAINER_ADDR;
+    g_blob = (const uint8_t *)raw_container + sizeof(Container);
     g_key = compute_key();
     uint64_t nonzero = cpu_timestamp() | 1ULL;
     g_key = obf_guard(g_key, nonzero, 0, 0);
 
+    decrypt_container(&g_container_storage, raw_container, g_key);
+    g_container = &g_container_storage;
+    if (g_container_storage.nsegs > MAX_SEGS) sys_exit(139);
+    g_key = obf_guard2(g_key, (uint64_t)g_container_storage.nsegs, 0, 0);
 
     for (uint32_t i = 0; i < g_container->nsegs; i++) {
         const SegDesc *segment = &g_container->segs[i];
@@ -202,7 +277,21 @@ void stub_main(void) {
     action.mask = 0;
     sys_install_segv_handler(&action);
 
-    void (*original_program)(void) = (void (*)(void))g_container->orig_entry;
+    struct signal_action decay_action;
+    decay_action.handler = (void *)on_decay_tick;
+    decay_action.flags = FLAG_SIGINFO | FLAG_RESTORER | FLAG_RESTART;
+    decay_action.restorer = (void *)return_from_signal;
+    decay_action.mask = 0;
+    sys_install_alarm_handler(&decay_action);
+
+    struct itimerval_raw decay_timer;
+    decay_timer.it_interval.tv_sec = 0;
+    decay_timer.it_interval.tv_usec = 50000;
+    decay_timer.it_value.tv_sec = 0;
+    decay_timer.it_value.tv_usec = 50000;
+    sys_setitimer(&decay_timer);
+
+    void (*original_program)(void) = (void (*)(void))obf_guard2(g_container->orig_entry, nonzero, 0, 0);
     original_program();
 
     sys_exit(0);
