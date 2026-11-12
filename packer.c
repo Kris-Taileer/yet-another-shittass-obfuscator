@@ -38,6 +38,26 @@ static void ensure_supported_elf(const Elf64_Ehdr *header) {
         fprintf(stderr, "oshibochka. either this isn't an elf or not a x86_64 arc nor non_pie\n");
         exit(1);
     }
+    if (header->e_phentsize != sizeof(Elf64_Phdr)) {
+        fprintf(stderr, "oshibochka. unexpected program header entry size\n");
+        exit(1);
+    }
+}
+
+/* ET_EXEC alone doesn't mean statically linked -- a non-PIE binary can
+ * still carry PT_INTERP/PT_DYNAMIC and need ld.so, which this packer
+ * never loads. Packing one anyway produces an output that jumps straight
+ * to the real entry with no relocations/symbol resolution done, which
+ * reliably crashes deep in its own startup instead of failing loudly
+ * here where the real problem is obvious. */
+static void ensure_statically_linked(const Elf64_Ehdr *header, const unsigned char *target) {
+    const Elf64_Phdr *phdrs = (const Elf64_Phdr *)(target + header->e_phoff);
+    for (int i = 0; i < header->e_phnum; i++) {
+        if (phdrs[i].p_type == PT_INTERP || phdrs[i].p_type == PT_DYNAMIC) {
+            fprintf(stderr, "oshibochka. input is dynamically linked (needs ld.so), this packer only supports static binaries\n");
+            exit(1);
+        }
+    }
 }
 
 static uint64_t random_build_key(void) {
@@ -130,6 +150,7 @@ int main(int argc, char **argv) {
 
     Elf64_Ehdr *target_header = (Elf64_Ehdr *)target;
     ensure_supported_elf(target_header);
+    ensure_statically_linked(target_header, target);
 
     uint64_t stub_entry_address = ((Elf64_Ehdr *)stub_elf)->e_entry;
     uint64_t build_key = random_build_key();
@@ -140,6 +161,14 @@ int main(int argc, char **argv) {
     container.orig_entry = target_header->e_entry;
     container.nsegs = 0;
 
+    size_t phdr_bytes = (size_t)target_header->e_phnum * target_header->e_phentsize;
+    if (phdr_bytes > MAX_ORIG_PHDR_BYTES) {
+        fprintf(stderr, "oshibochka. input has too many/too large program headers\n");
+        exit(1);
+    }
+    memcpy(container.orig_phdr_raw, target + target_header->e_phoff, phdr_bytes);
+    container.orig_phnum = target_header->e_phnum;
+
     unsigned char *blob = malloc(target_size * 2 + 4096);
     size_t blob_size = 0;
 
@@ -148,7 +177,16 @@ int main(int argc, char **argv) {
         Elf64_Phdr *ph = &program_headers[i];
 
         if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_filesz == 0)continue;
+        /* filesz==0 but memsz>0 is a legitimate bss-only PT_LOAD segment:
+         * nothing to compress, but the stub still needs to reserve and
+         * zero that memory range, so it must still get a SegDesc.
+         * Skip only genuinely empty segments. */
+        if (ph->p_memsz == 0) continue;
+
+        if (container.nsegs >= MAX_SEGS) {
+            fprintf(stderr, "oshibochka. input has more than %d loadable segments\n", MAX_SEGS);
+            exit(1);
+        }
 
         SegDesc *segment = &container.segs[container.nsegs];
         segment->vaddr = ph->p_vaddr;

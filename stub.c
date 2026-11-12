@@ -166,11 +166,54 @@ static const Container *g_container;
 static const uint8_t *g_blob;
 static uint8_t g_segment_ready[MAX_SEGS];
 
+/* The kernel sets up argc/argv/envp/auxv on the initial stack at process
+ * start, and the wrapped program's own _start/libc startup reads them
+ * relative to %rsp exactly as it was at entry. stub_entry saves that
+ * untouched original %rsp here (before realigning its own copy for the
+ * C call into stub_main) so jump_with_original_stack can hand the
+ * unpacked program the real thing instead of a %rsp buried several
+ * frames into stub_main's own call stack. */
+uint64_t g_orig_rsp;
+
+extern void jump_with_original_stack(void *entry, uint64_t rsp) __attribute__((noreturn));
+__asm__(
+    ".text\n"
+    ".global jump_with_original_stack\n"
+    "jump_with_original_stack:\n"
+    "   mov %rsi, %rsp\n"
+    "   jmp *%rdi\n"
+);
+
 static void decrypt_container(Container *out, const Container *in, uint64_t key) {
     const uint8_t *src = (const uint8_t *)in;
     uint8_t *dst = (uint8_t *)out;
     for (size_t i = 0; i < sizeof(Container); i++) {
         dst[i] = src[i] ^ keystream_byte(key, CONTAINER_KEYSTREAM_BASE + i);
+    }
+}
+
+#define AT_PHDR 3
+#define AT_PHNUM 5
+#define AT_ENTRY 9
+
+/* The kernel built the auxv on this stack for OUR stub's own ELF layout
+ * (one combined segment), not the wrapped program's real one. Its libc
+ * startup walks AT_PHDR/AT_PHNUM expecting to find its own PT_TLS,
+ * PT_GNU_RELRO etc. among real program headers; handed the stub's,
+ * it finds nothing and silently leaves whatever global it meant to set
+ * at zero. Patching these three entries to point at the embedded copy
+ * of the original phdrs (and its real entry) makes that walk honest. */
+static void patch_auxv(uint64_t rsp, const void *orig_phdr, uint64_t orig_phnum, uint64_t orig_entry) {
+    uint64_t *p = (uint64_t *)rsp;
+    uint64_t argc = p[0];
+    uint64_t *cursor = p + 1 + argc + 1;
+    while (*cursor != 0) cursor++;
+    cursor++;
+
+    for (uint64_t *av = cursor; av[0] != 0; av += 2) {
+        if (av[0] == AT_PHDR) av[1] = (uint64_t)orig_phdr;
+        else if (av[0] == AT_PHNUM) av[1] = orig_phnum;
+        else if (av[0] == AT_ENTRY) av[1] = orig_entry;
     }
 }
 
@@ -220,10 +263,16 @@ static void on_page_fault(int signal_number, void *signal_info, void *context) {
  * a few live segments in the clear, never the whole unpacked image at
  * once. The wiped segment is simply lazily re-decrypted on next touch via
  * the normal on_page_fault path. */
+/* Offset of uc_mcontext.gregs[REG_RIP] within ucontext_t on x86-64 Linux
+ * (glibc layout: 8-byte uc_flags + 8-byte uc_link + 24-byte uc_stack,
+ * then mcontext_t's gregs[16]). Verified empirically against a live
+ * fault's reported RIP. */
+#define SIG_CONTEXT_RIP_OFFSET 168
+
 static void on_decay_tick(int signal_number, void *signal_info, void *context) {
     (void)signal_number;
     (void)signal_info;
-    (void)context;
+    uint64_t rip = *(uint64_t *)((char *)context + SIG_CONTEXT_RIP_OFFSET);
 
     for (uint32_t i = 0; i < g_container->nsegs; i++) {
         if (!g_segment_ready[i]) continue;
@@ -232,8 +281,14 @@ static void on_decay_tick(int signal_number, void *signal_info, void *context) {
         uint64_t start = page_start(segment->vaddr);
         uint64_t end   = page_end(segment->vaddr + segment->memsz);
 
+        /* Actively executing in this segment right now -- decaying it
+         * would just force an immediate, constant re-decrypt thrash
+         * instead of actually hiding anything. Leave it; decay the
+         * segments that have gone quiet instead. */
+        if (rip >= start && rip < end) continue;
+
         sys_mprotect((void *)start, end - start, PAGE_READ | PAGE_WRITE);
-        for (uint8_t *p = (uint8_t *)start; p < (uint8_t *)end; p++) *p = 0;
+        for (uint64_t *p = (uint64_t *)start; p < (uint64_t *)end; p++) *p = 0;
         sys_mprotect((void *)start, end - start, PAGE_NONE);
         g_segment_ready[i] = 0;
     }
@@ -285,22 +340,23 @@ void stub_main(void) {
     sys_install_alarm_handler(&decay_action);
 
     struct itimerval_raw decay_timer;
-    decay_timer.it_interval.tv_sec = 0;
-    decay_timer.it_interval.tv_usec = 50000;
-    decay_timer.it_value.tv_sec = 0;
-    decay_timer.it_value.tv_usec = 50000;
+    decay_timer.it_interval.tv_sec = 1;
+    decay_timer.it_interval.tv_usec = 0;
+    decay_timer.it_value.tv_sec = 1;
+    decay_timer.it_value.tv_usec = 0;
     sys_setitimer(&decay_timer);
 
-    void (*original_program)(void) = (void (*)(void))obf_guard2(g_container->orig_entry, nonzero, 0, 0);
-    original_program();
+    patch_auxv(g_orig_rsp, g_container_storage.orig_phdr_raw, g_container_storage.orig_phnum, g_container_storage.orig_entry);
 
-    sys_exit(0);
+    void *entry = (void *)obf_guard2(g_container->orig_entry, nonzero, 0, 0);
+    jump_with_original_stack(entry, g_orig_rsp);
 }
 
 __asm__(
     ".section .text.entry,\"ax\"\n"
     ".global stub_entry\n"
     "stub_entry:\n"
+    "   mov %rsp, g_orig_rsp(%rip)\n"
     "   xor %rbp, %rbp\n"
     "   and $-16, %rsp\n"
     "   call stub_main\n"
